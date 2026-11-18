@@ -47,7 +47,7 @@ func cmdRun(args []string, e env) (int, error) {
 	})
 	store.ProcessExited() // spec lifetime rule: working and blocked go, done and error stay
 	pub.close(status.Summarize(store.All()))
-	hd.Publish(status.Summarize(store.All()))
+	hd.Close(status.Summarize(store.All()))
 	pub.reportErrors(e.stderr)
 	return code, err
 }

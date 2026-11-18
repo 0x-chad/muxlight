@@ -26,9 +26,15 @@ const timeout = 2 * time.Second
 var Prefix = envOr("MUXLIGHT_HC_PREFIX", "sv-")
 
 // Publisher reports summaries for one pane. The zero value is disabled.
+//
+// Publish never blocks: it runs on its own goroutine and keeps only the latest
+// summary, because Publish is called from the shim's output path and a stalled
+// hc would stall the agent's screen.
 type Publisher struct {
 	hc     string // hc binary; empty disables
 	target string // herdr terminal name
+	latest chan status.Summary
+	done   chan struct{}
 }
 
 // New returns a Publisher for pane, or a disabled one when MUXLIGHT_HC is
@@ -42,18 +48,57 @@ func New(pane string) *Publisher {
 	if win == "" {
 		return &Publisher{}
 	}
-	return &Publisher{hc: hc, target: Prefix + win}
+	p := &Publisher{
+		hc:     hc,
+		target: Prefix + win,
+		latest: make(chan status.Summary, 1),
+		done:   make(chan struct{}),
+	}
+	go p.loop()
+	return p
 }
 
 // Enabled reports whether Publish will do anything.
 func (p *Publisher) Enabled() bool { return p != nil && p.hc != "" }
 
-// Publish sends one summary. Errors are ignored: a status mirror must never
-// disturb the agent, and hc may legitimately have no terminal for this window.
+// Publish queues one summary, replacing any still-pending one. It never blocks.
 func (p *Publisher) Publish(s status.Summary) {
 	if !p.Enabled() {
 		return
 	}
+	for {
+		select {
+		case p.latest <- s:
+			return
+		default:
+			select {
+			case <-p.latest: // drop the stale one
+			default:
+			}
+		}
+	}
+}
+
+// Close publishes final after everything already queued, then stops.
+func (p *Publisher) Close(final status.Summary) {
+	if !p.Enabled() {
+		return
+	}
+	close(p.latest)
+	<-p.done
+	p.send(final)
+}
+
+func (p *Publisher) loop() {
+	defer close(p.done)
+	for s := range p.latest {
+		p.send(s)
+	}
+}
+
+// send runs one hc report. Errors are ignored: a status mirror must never
+// disturb the agent, and hc may legitimately have no terminal for this window.
+func (p *Publisher) send(s status.Summary) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.hc, "report", body(s), "--terminal", p.target)

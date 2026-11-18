@@ -37,10 +37,11 @@ type Publisher struct {
 	done   chan struct{}
 }
 
-// New returns a Publisher for pane, or a disabled one when MUXLIGHT_HC is
-// unset or the window name cannot be read.
+// New returns a Publisher for pane. It finds hc on PATH; MUXLIGHT_HC names a
+// different binary, and MUXLIGHT_HC=off disables mirroring. A Publisher is
+// disabled when hc is absent or the window name cannot be read.
 func New(pane string) *Publisher {
-	hc := os.Getenv("MUXLIGHT_HC")
+	hc := resolveHC()
 	if hc == "" || pane == "" {
 		return &Publisher{}
 	}
@@ -134,6 +135,22 @@ func sanitize(v string) string {
 		}
 	}
 	return b.String()
+}
+
+// resolveHC returns the hc binary to use, or "" when mirroring is off.
+func resolveHC() string {
+	switch v := os.Getenv("MUXLIGHT_HC"); v {
+	case "":
+		path, err := exec.LookPath("hc")
+		if err != nil {
+			return ""
+		}
+		return path
+	case "off", "0", "no", "false":
+		return ""
+	default:
+		return v
+	}
 }
 
 func tmuxWindowName(pane string) string {

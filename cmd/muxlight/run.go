@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/adamvduke/pst"
+	"github.com/paipaiio/muxlight/internal/herdr"
 	"github.com/paipaiio/muxlight/internal/shim"
 	"github.com/paipaiio/muxlight/internal/status"
 	"github.com/paipaiio/muxlight/internal/tmux"
@@ -33,14 +34,20 @@ func cmdRun(args []string, e env) (int, error) {
 	store := pst.NewStore()
 	pub := newAsyncPublisher(tmux.NewPublisher(e.runner, pane))
 	pub.publish(status.Summary{}) // drop a previous run's record
+	// Mirror into herdr, which cannot see the report itself through tmux.
+	hd := herdr.New(pane)
+	hd.Publish(status.Summary{})
 
 	code, err := shim.RunWith(args, e.stdin, e.stdout, func(r pst.Report) {
 		if len(store.Apply(r)) > 0 {
-			pub.send(status.Summarize(store.All()))
+			s := status.Summarize(store.All())
+			pub.send(s)
+			hd.Publish(s)
 		}
 	})
 	store.ProcessExited() // spec lifetime rule: working and blocked go, done and error stay
 	pub.close(status.Summarize(store.All()))
+	hd.Publish(status.Summarize(store.All()))
 	pub.reportErrors(e.stderr)
 	return code, err
 }

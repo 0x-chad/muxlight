@@ -47,19 +47,28 @@ type Publisher struct {
 
 // New returns a Publisher for pane. It finds hc on PATH; MUXLIGHT_HC names a
 // different binary, and MUXLIGHT_HC=off disables mirroring. A Publisher is
-// disabled when hc is absent or the window name cannot be read.
+// disabled when hc is absent, or when no herdr terminal can be addressed.
+//
+// There are two ways an agent reaches herdr. When herdr started it, the agent
+// is already inside a herdr terminal and HC_TERMINAL_ID names it; report
+// straight there. Otherwise the agent is in a tmux window someone else made,
+// and herdr sees it through a view session named after the window id.
 func New(pane string) *Publisher {
 	hc := resolveHC()
 	if hc == "" || pane == "" {
 		return &Publisher{}
 	}
-	win := tmuxWindowID(pane)
-	if win == "" {
-		return &Publisher{}
+	target := os.Getenv("HC_TERMINAL_ID")
+	if target == "" {
+		win := tmuxWindowID(pane)
+		if win == "" {
+			return &Publisher{}
+		}
+		target = prefix + win
 	}
 	p := &Publisher{
 		hc:     hc,
-		target: prefix + win,
+		target: target,
 		latest: make(chan status.Summary, 1),
 		done:   make(chan struct{}),
 	}

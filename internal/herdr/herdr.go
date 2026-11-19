@@ -23,13 +23,15 @@ import (
 const timeout = 2 * time.Second
 
 // prefix forms the herdr terminal name from the pane's tmux window id: the
-// view session backing that tab, "herdr-view/@129". The window id is used
+// view session backing that tab, "herdr-view-129" for window @129. The "@" is
+// dropped because hc names allow only a-z 0-9 - _ . and tmux forbids ":" and
+// ".", so this spelling is legal in both. The window id is used
 // rather than its name because a window linked into a view belongs to both
 // sessions, so a pane cannot tell which session owns it, and because names
 // change under automatic-rename while ids do not. Deliberately not settable:
 // it must equal the prefix the view sessions are created with, and a mismatch
 // fails silently because report errors are ignored. Change it in both places.
-const prefix = "herdr-view/"
+const prefix = "herdr-view-"
 
 // Publisher reports summaries for one pane. The zero value is disabled.
 //
@@ -168,6 +170,6 @@ func tmuxWindowID(pane string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimPrefix(strings.TrimSpace(string(out)), "@")
 }
 

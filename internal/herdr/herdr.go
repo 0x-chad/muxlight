@@ -22,8 +22,11 @@ import (
 
 const timeout = 2 * time.Second
 
-// prefix forms the herdr terminal name from the tmux window name: the view
-// session backing that tab, "herdr-view/audit". Deliberately not settable:
+// prefix forms the herdr terminal name from the pane's tmux window id: the
+// view session backing that tab, "herdr-view/@129". The window id is used
+// rather than its name because a window linked into a view belongs to both
+// sessions, so a pane cannot tell which session owns it, and because names
+// change under automatic-rename while ids do not. Deliberately not settable:
 // it must equal the prefix the view sessions are created with, and a mismatch
 // fails silently because report errors are ignored. Change it in both places.
 const prefix = "herdr-view/"
@@ -48,7 +51,7 @@ func New(pane string) *Publisher {
 	if hc == "" || pane == "" {
 		return &Publisher{}
 	}
-	win := tmuxWindowName(pane)
+	win := tmuxWindowID(pane)
 	if win == "" {
 		return &Publisher{}
 	}
@@ -156,10 +159,12 @@ func resolveHC() string {
 	}
 }
 
-func tmuxWindowName(pane string) string {
+// tmuxWindowID returns the pane's window id ("@129"), tmux's stable identity
+// for the window, independent of name or session membership.
+func tmuxWindowID(pane string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "-t", pane, "#W").Output()
+	out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "-t", pane, "#{window_id}").Output()
 	if err != nil {
 		return ""
 	}

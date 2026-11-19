@@ -22,8 +22,9 @@ import (
 
 const timeout = 2 * time.Second
 
-// Prefix is prepended to the tmux window name to form the herdr terminal name.
-var Prefix = envOr("MUXLIGHT_HC_PREFIX", "sv-")
+// Prefix is prepended to the tmux window name to form the herdr terminal name,
+// matching the view sessions that back herdr tabs ("herdr-view/audit").
+var Prefix = envOr("MUXLIGHT_HC_PREFIX", "herdr-view/")
 
 // Publisher reports summaries for one pane. The zero value is disabled.
 //

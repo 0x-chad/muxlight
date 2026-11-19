@@ -22,9 +22,11 @@ import (
 
 const timeout = 2 * time.Second
 
-// Prefix is prepended to the tmux window name to form the herdr terminal name,
-// matching the view sessions that back herdr tabs ("herdr-view/audit").
-var Prefix = envOr("MUXLIGHT_HC_PREFIX", "herdr-view/")
+// prefix forms the herdr terminal name from the tmux window name: the view
+// session backing that tab, "herdr-view/audit". Deliberately not settable:
+// it must equal the prefix the view sessions are created with, and a mismatch
+// fails silently because report errors are ignored. Change it in both places.
+const prefix = "herdr-view/"
 
 // Publisher reports summaries for one pane. The zero value is disabled.
 //
@@ -52,7 +54,7 @@ func New(pane string) *Publisher {
 	}
 	p := &Publisher{
 		hc:     hc,
-		target: Prefix + win,
+		target: prefix + win,
 		latest: make(chan status.Summary, 1),
 		done:   make(chan struct{}),
 	}
@@ -164,9 +166,3 @@ func tmuxWindowName(pane string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}

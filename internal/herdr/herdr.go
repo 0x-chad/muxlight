@@ -72,12 +72,12 @@ func New(pane string) *Publisher {
 		return &Publisher{}
 	}
 	target := os.Getenv("HC_TERMINAL_ID")
-	window := ""
-	if target == "" {
-		window = tmuxWindowID(pane)
-		if window == "" {
-			return &Publisher{}
-		}
+	// The window is looked up even when HC_TERMINAL_ID is set. That variable can
+	// be stale: a tmux server started from a herdr terminal hands its id to
+	// every window it makes, long after that terminal is gone.
+	window := tmuxWindowID(pane)
+	if target == "" && window == "" {
+		return &Publisher{}
 	}
 	p := &Publisher{
 		hc:     hc,
@@ -161,22 +161,35 @@ func (p *Publisher) firstRetry() time.Duration {
 // send runs one hc report. Errors are ignored: a status mirror must never
 // disturb the agent, and hc may legitimately have no terminal for this window.
 func (p *Publisher) send(s status.Summary) {
-	target := p.target
-	fromLabel := target == ""
-	if fromLabel {
-		target = p.lookup()
-		if target == "" {
+	if p.target != "" {
+		if p.report(p.target, s) {
 			return
 		}
+		// The terminal named by the environment is gone. With no window to
+		// find another by there is nothing more to try; otherwise forget it
+		// and look for the terminal labelled with this pane's window.
+		if p.window == "" {
+			return
+		}
+		p.target = ""
 	}
+	target := p.lookup()
+	if target == "" {
+		return
+	}
+	if !p.report(target, s) {
+		// The terminal went away (the tab was demoted); look it up afresh next time.
+		p.resolved = ""
+	}
+}
+
+// report runs one hc report and says whether it was delivered.
+func (p *Publisher) report(target string, s status.Summary) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.hc, "report", body(s), "--terminal", target)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	if err := cmd.Run(); err != nil && fromLabel {
-		// The terminal went away (the tab was demoted); look it up afresh next time.
-		p.resolved = ""
-	}
+	return cmd.Run() == nil
 }
 
 // lookup returns the address of the terminal labelled with this pane's window

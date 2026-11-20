@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/adamvduke/pst"
 	"github.com/paipaiio/muxlight/internal/status"
@@ -128,4 +129,57 @@ func TestHerdrStartedAgentReportsStraightToItsTerminal(t *testing.T) {
 	if got := lines(t, log); len(got) != 1 || !strings.Contains(got[0], "--terminal t3") {
 		t.Errorf("got %v, want one report to t3", got)
 	}
+}
+
+// A terminal attached after the agent last changed state must still be told
+// the current status, without waiting for the next change.
+func TestResendsCurrentStatusOnceATerminalAppears(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	up := filepath.Join(dir, "up")
+	hc := filepath.Join(dir, "hc")
+	script := `#!/bin/sh
+case "$1" in
+ls)
+  if [ -e ` + up + ` ]; then echo '{"terminals":[{"address":"t9"}]}'; else echo '{"terminals":[]}'; fi
+  ;;
+report)
+  echo "$*" >> ` + log + `
+  ;;
+esac
+`
+	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Publisher{
+		hc:     hc,
+		window: "42",
+		retry:  20 * time.Millisecond,
+		latest: make(chan status.Summary, 1),
+		done:   make(chan struct{}),
+	}
+	go p.loop()
+	defer func() { close(p.latest); <-p.done }()
+
+	p.Publish(working()) // no terminal yet: nothing to send it to
+	time.Sleep(150 * time.Millisecond)
+	if got := lines(t, log); len(got) != 0 {
+		t.Fatalf("reported with no terminal: %v", got)
+	}
+
+	if err := os.WriteFile(up, nil, 0o644); err != nil { // the tab is attached
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := lines(t, log); len(got) > 0 {
+			if !strings.Contains(got[0], "state=working") || !strings.Contains(got[0], "--terminal t9") {
+				t.Fatalf("resent the wrong thing: %v", got)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("status was never resent after the terminal appeared")
 }

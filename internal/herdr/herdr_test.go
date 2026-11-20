@@ -183,3 +183,57 @@ esac
 	}
 	t.Fatal("status was never resent after the terminal appeared")
 }
+
+// HC_TERMINAL_ID can name a terminal that no longer exists: a tmux server
+// started from a herdr terminal hands that id to every window it makes. A
+// report to it fails, and the pane's own window label must take over.
+func TestStaleTerminalIDFallsThroughToTheWindowLabel(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	hc := filepath.Join(dir, "hc")
+	script := `#!/bin/sh
+case "$1" in
+ls)
+  echo '{"terminals":[{"address":"t9"}]}'
+  ;;
+report)
+  for a in "$@"; do
+    [ "$a" = "t3" ] && exit 3
+  done
+  echo "$*" >> ` + log + `
+  ;;
+esac
+`
+	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := &Publisher{hc: hc, target: "t3", window: "42"}
+	p.send(working())
+	p.send(working())
+
+	got := lines(t, log)
+	if len(got) != 2 {
+		t.Fatalf("got %v, want both reports delivered to t9", got)
+	}
+	for _, l := range got {
+		if !strings.Contains(l, "--terminal t9") {
+			t.Errorf("report went to the stale terminal, not the labelled one: %q", l)
+		}
+	}
+	if p.target != "" {
+		t.Errorf("stale target kept: %q", p.target)
+	}
+}
+
+func TestStaleTerminalIDWithNoWindowDoesNothing(t *testing.T) {
+	dir := t.TempDir()
+	hc := filepath.Join(dir, "hc")
+	if err := os.WriteFile(hc, []byte("#!/bin/sh\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := &Publisher{hc: hc, target: "t3"} // no window to find another terminal by
+	p.send(working())
+	if p.target != "t3" {
+		t.Errorf("dropped its only target: %q", p.target)
+	}
+}

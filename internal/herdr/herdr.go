@@ -23,6 +23,15 @@ import (
 
 const timeout = 2 * time.Second
 
+// While no herdr terminal carries this pane's window label, look again this
+// often, backing off to maxRetry. Reports only happen on a change, so a tab
+// attached after the agent last changed state would otherwise show nothing
+// until its next transition, which for an idle agent may be hours away.
+const (
+	firstRetry = 3 * time.Second
+	maxRetry   = 60 * time.Second
+)
+
 // windowLabel is the label herdr-focus puts on a view terminal, carrying the
 // tmux window id without its "@" ("129" for window @129). The terminal is
 // found by this label, not by name, so its name is free to be readable: herdr
@@ -38,10 +47,11 @@ const windowLabel = "herdr.window"
 // summary, because Publish is called from the shim's output path and a stalled
 // hc would stall the agent's screen.
 type Publisher struct {
-	hc       string // hc binary; empty disables
-	target   string // herdr terminal address; resolved lazily when empty
-	window   string // tmux window id without "@", used to find the terminal
-	resolved string // address found by label, kept until a report to it fails
+	hc       string        // hc binary; empty disables
+	target   string        // herdr terminal address; resolved lazily when empty
+	window   string        // tmux window id without "@", used to find the terminal
+	resolved string        // address found by label, kept until a report to it fails
+	retry    time.Duration // first wait between lookups while unresolved; zero uses firstRetry
 	latest   chan status.Summary
 	done     chan struct{}
 }
@@ -113,9 +123,39 @@ func (p *Publisher) Close(final status.Summary) {
 
 func (p *Publisher) loop() {
 	defer close(p.done)
-	for s := range p.latest {
-		p.send(s)
+	wait := p.firstRetry()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	var last status.Summary
+	have := false
+	for {
+		select {
+		case s, ok := <-p.latest:
+			if !ok {
+				return
+			}
+			last, have = s, true
+			p.send(s)
+			wait = p.firstRetry()
+		case <-timer.C:
+			// Nothing to resend, or nowhere it needs to go: a herdr-started
+			// agent has a fixed target, and a resolved one is already told.
+			if have && p.target == "" && p.resolved == "" && p.lookup() != "" {
+				p.send(last)
+			}
+			if wait *= 2; wait > maxRetry {
+				wait = maxRetry
+			}
+			timer.Reset(wait)
+		}
 	}
+}
+
+func (p *Publisher) firstRetry() time.Duration {
+	if p.retry > 0 {
+		return p.retry
+	}
+	return firstRetry
 }
 
 // send runs one hc report. Errors are ignored: a status mirror must never

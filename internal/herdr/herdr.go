@@ -13,6 +13,7 @@ package herdr
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -60,22 +61,27 @@ type Publisher struct {
 // different binary, and MUXLIGHT_HC=off disables mirroring. A Publisher is
 // disabled when hc is absent, or when no herdr terminal can be addressed.
 //
-// There are two ways an agent reaches herdr. When herdr started it, the agent
-// is already inside a herdr terminal and HC_TERMINAL_ID names it; report
-// straight there. Otherwise the agent is in a tmux window someone else made,
-// and herdr sees it through a view terminal carrying a herdr.window label with
-// the window id. That terminal may not exist yet, or may come and go as the tab
-// is promoted and demoted, so it is looked up when a report is sent.
+// There are two ways an agent reaches herdr, and a pane uses exactly one. When
+// herdr started it outside tmux, the agent is already inside a herdr terminal
+// and HC_TERMINAL_ID names it; report straight there. When it runs in a tmux
+// window, herdr sees it through a view terminal carrying a herdr.window label
+// with the window id. That terminal may not exist yet, or may come and go as
+// the tab is promoted and demoted, so it is looked up when a report is sent.
 func New(pane string) *Publisher {
 	hc := resolveHC()
 	if hc == "" || pane == "" {
 		return &Publisher{}
 	}
-	target := os.Getenv("HC_TERMINAL_ID")
-	// The window is looked up even when HC_TERMINAL_ID is set. That variable can
-	// be stale: a tmux server started from a herdr terminal hands its id to
-	// every window it makes, long after that terminal is gone.
+	// A pane in a tmux window is found by that window's label and nothing
+	// else: HC_TERMINAL_ID cannot be trusted there, because a tmux server
+	// started from a herdr terminal hands its id to every window it makes, long
+	// after that terminal is gone. A pane outside tmux was started by herdr, and
+	// HC_TERMINAL_ID is its terminal.
 	window := tmuxWindowID(pane)
+	target := ""
+	if window == "" {
+		target = os.Getenv("HC_TERMINAL_ID")
+	}
 	if target == "" && window == "" {
 		return &Publisher{}
 	}
@@ -158,26 +164,17 @@ func (p *Publisher) firstRetry() time.Duration {
 	return firstRetry
 }
 
-// send runs one hc report. Errors are ignored: a status mirror must never
-// disturb the agent, and hc may legitimately have no terminal for this window.
+// send runs one hc report. Failures never reach the agent, but each is written
+// to the MUXLIGHT_DEBUG file when one is set, so a status that does not arrive
+// can be explained.
 func (p *Publisher) send(s status.Summary) {
-	if p.target != "" {
-		if p.report(p.target, s) {
-			return
-		}
-		// The terminal named by the environment is gone. With no window to
-		// find another by there is nothing more to try; otherwise forget it
-		// and look for the terminal labelled with this pane's window.
-		if p.window == "" {
-			return
-		}
-		p.target = ""
-	}
-	target := p.lookup()
+	target := p.target
 	if target == "" {
-		return
+		if target = p.lookup(); target == "" {
+			return
+		}
 	}
-	if !p.report(target, s) {
+	if !p.report(target, s) && p.target == "" {
 		// The terminal went away (the tab was demoted); look it up afresh next time.
 		p.resolved = ""
 	}
@@ -189,7 +186,11 @@ func (p *Publisher) report(target string, s status.Summary) bool {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.hc, "report", body(s), "--terminal", target)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	return cmd.Run() == nil
+	if err := cmd.Run(); err != nil {
+		debugf("report to %s failed: %v", target, err)
+		return false
+	}
+	return true
 }
 
 // lookup returns the address of the terminal labelled with this pane's window
@@ -204,6 +205,7 @@ func (p *Publisher) lookup() string {
 	out, err := exec.CommandContext(ctx, p.hc, "ls", "--json",
 		"--label", windowLabel+"="+p.window).Output()
 	if err != nil {
+		debugf("lookup of %s=%s failed: %v", windowLabel, p.window, err)
 		return ""
 	}
 	var list struct {
@@ -211,7 +213,11 @@ func (p *Publisher) lookup() string {
 			Address string `json:"address"`
 		} `json:"terminals"`
 	}
-	if json.Unmarshal(out, &list) != nil || len(list.Terminals) == 0 {
+	if err := json.Unmarshal(out, &list); err != nil {
+		debugf("lookup of %s=%s: unreadable answer: %v", windowLabel, p.window, err)
+		return ""
+	}
+	if len(list.Terminals) == 0 {
 		return ""
 	}
 	p.resolved = list.Terminals[0].Address
@@ -274,4 +280,19 @@ func tmuxWindowID(pane string) string {
 		return ""
 	}
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "@")
+}
+
+// debugf appends one line to the file named by MUXLIGHT_DEBUG, if any. It is a
+// file, not stderr, because stderr here is the user's terminal.
+func debugf(format string, args ...any) {
+	path := os.Getenv("MUXLIGHT_DEBUG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s herdr: %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
 }

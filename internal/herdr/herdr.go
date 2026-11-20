@@ -4,14 +4,15 @@
 // herdr reads status from a program's own terminal, which tmux consumes before
 // herdr can see it. `hc report` is herdr-core's supported side channel for
 // exactly this case, so muxlight forwards each summary as it happens. The
-// terminal is addressed by name: a pane in tmux window "audit" reports to the
-// herdr terminal "sv-audit", matching the grouped-session tabs.
+// terminal is found by label: a pane in tmux window @129 reports to the herdr
+// terminal labelled herdr.window=129.
 //
 // Disabled unless MUXLIGHT_HC names an hc binary.
 package herdr
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -22,16 +23,14 @@ import (
 
 const timeout = 2 * time.Second
 
-// prefix forms the herdr terminal name from the pane's tmux window id: the
-// view session backing that tab, "herdr-view-129" for window @129. The "@" is
-// dropped because hc names allow only a-z 0-9 - _ . and tmux forbids ":" and
-// ".", so this spelling is legal in both. The window id is used
-// rather than its name because a window linked into a view belongs to both
-// sessions, so a pane cannot tell which session owns it, and because names
-// change under automatic-rename while ids do not. Deliberately not settable:
-// it must equal the prefix the view sessions are created with, and a mismatch
-// fails silently because report errors are ignored. Change it in both places.
-const prefix = "herdr-view-"
+// windowLabel is the label herdr-focus puts on a view terminal, carrying the
+// tmux window id without its "@" ("129" for window @129). The terminal is
+// found by this label, not by name, so its name is free to be readable: herdr
+// clients show it as the agent's name. The window id rather than the window
+// name because a window linked into a view belongs to both sessions, so a pane
+// cannot tell which session owns it, and because names change under
+// automatic-rename while ids do not.
+const windowLabel = "herdr.window"
 
 // Publisher reports summaries for one pane. The zero value is disabled.
 //
@@ -39,10 +38,12 @@ const prefix = "herdr-view-"
 // summary, because Publish is called from the shim's output path and a stalled
 // hc would stall the agent's screen.
 type Publisher struct {
-	hc     string // hc binary; empty disables
-	target string // herdr terminal name
-	latest chan status.Summary
-	done   chan struct{}
+	hc       string // hc binary; empty disables
+	target   string // herdr terminal address; resolved lazily when empty
+	window   string // tmux window id without "@", used to find the terminal
+	resolved string // address found by label, kept until a report to it fails
+	latest   chan status.Summary
+	done     chan struct{}
 }
 
 // New returns a Publisher for pane. It finds hc on PATH; MUXLIGHT_HC names a
@@ -52,23 +53,26 @@ type Publisher struct {
 // There are two ways an agent reaches herdr. When herdr started it, the agent
 // is already inside a herdr terminal and HC_TERMINAL_ID names it; report
 // straight there. Otherwise the agent is in a tmux window someone else made,
-// and herdr sees it through a view session named after the window id.
+// and herdr sees it through a view terminal carrying a herdr.window label with
+// the window id. That terminal may not exist yet, or may come and go as the tab
+// is promoted and demoted, so it is looked up when a report is sent.
 func New(pane string) *Publisher {
 	hc := resolveHC()
 	if hc == "" || pane == "" {
 		return &Publisher{}
 	}
 	target := os.Getenv("HC_TERMINAL_ID")
+	window := ""
 	if target == "" {
-		win := tmuxWindowID(pane)
-		if win == "" {
+		window = tmuxWindowID(pane)
+		if window == "" {
 			return &Publisher{}
 		}
-		target = prefix + win
 	}
 	p := &Publisher{
 		hc:     hc,
 		target: target,
+		window: window,
 		latest: make(chan status.Summary, 1),
 		done:   make(chan struct{}),
 	}
@@ -117,11 +121,48 @@ func (p *Publisher) loop() {
 // send runs one hc report. Errors are ignored: a status mirror must never
 // disturb the agent, and hc may legitimately have no terminal for this window.
 func (p *Publisher) send(s status.Summary) {
+	target := p.target
+	fromLabel := target == ""
+	if fromLabel {
+		target = p.lookup()
+		if target == "" {
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.hc, "report", body(s), "--terminal", p.target)
+	cmd := exec.CommandContext(ctx, p.hc, "report", body(s), "--terminal", target)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil && fromLabel {
+		// The terminal went away (the tab was demoted); look it up afresh next time.
+		p.resolved = ""
+	}
+}
+
+// lookup returns the address of the terminal labelled with this pane's window
+// id, or "" when there is none. A found address is kept until a report to it
+// fails, so a status change costs one hc call, not two.
+func (p *Publisher) lookup() string {
+	if p.resolved != "" {
+		return p.resolved
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, p.hc, "ls", "--json",
+		"--label", windowLabel+"="+p.window).Output()
+	if err != nil {
+		return ""
+	}
+	var list struct {
+		Terminals []struct {
+			Address string `json:"address"`
+		} `json:"terminals"`
+	}
+	if json.Unmarshal(out, &list) != nil || len(list.Terminals) == 0 {
+		return ""
+	}
+	p.resolved = list.Terminals[0].Address
+	return p.resolved
 }
 
 // body renders the summary as an OSC 7501 report body, as a program would
@@ -181,4 +222,3 @@ func tmuxWindowID(pane string) string {
 	}
 	return strings.TrimPrefix(strings.TrimSpace(string(out)), "@")
 }
-

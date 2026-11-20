@@ -184,56 +184,80 @@ esac
 	t.Fatal("status was never resent after the terminal appeared")
 }
 
-// HC_TERMINAL_ID can name a terminal that no longer exists: a tmux server
-// started from a herdr terminal hands that id to every window it makes. A
-// report to it fails, and the pane's own window label must take over.
-func TestStaleTerminalIDFallsThroughToTheWindowLabel(t *testing.T) {
+// A pane with a target reports only there: no lookup, and no second path if
+// the report fails. New is what keeps a leaked HC_TERMINAL_ID out of a tmux
+// pane (see TestNewIgnoresTheEnvironmentTerminalInsideTmux).
+func TestTargetIsNeverReplacedByALabelLookup(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "log")
 	hc := filepath.Join(dir, "hc")
 	script := `#!/bin/sh
-case "$1" in
-ls)
-  echo '{"terminals":[{"address":"t9"}]}'
-  ;;
-report)
-  for a in "$@"; do
-    [ "$a" = "t3" ] && exit 3
-  done
-  echo "$*" >> ` + log + `
-  ;;
-esac
+echo "$*" >> ` + log + `
+exit 3
 `
 	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	p := &Publisher{hc: hc, target: "t3", window: "42"}
 	p.send(working())
-	p.send(working())
-
 	got := lines(t, log)
-	if len(got) != 2 {
-		t.Fatalf("got %v, want both reports delivered to t9", got)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "report") {
+		t.Errorf("got %v, want a single failed report and no lookup", got)
 	}
-	for _, l := range got {
-		if !strings.Contains(l, "--terminal t9") {
-			t.Errorf("report went to the stale terminal, not the labelled one: %q", l)
-		}
-	}
-	if p.target != "" {
-		t.Errorf("stale target kept: %q", p.target)
+	if p.target != "t3" {
+		t.Errorf("target changed: %q", p.target)
 	}
 }
 
-func TestStaleTerminalIDWithNoWindowDoesNothing(t *testing.T) {
+func TestNewIgnoresTheEnvironmentTerminalInsideTmux(t *testing.T) {
 	dir := t.TempDir()
 	hc := filepath.Join(dir, "hc")
-	if err := os.WriteFile(hc, []byte("#!/bin/sh\nexit 3\n"), 0o755); err != nil {
-		t.Fatal(err)
+	tmux := filepath.Join(dir, "tmux")
+	os.WriteFile(hc, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	os.WriteFile(tmux, []byte("#!/bin/sh\necho @42\n"), 0o755)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("MUXLIGHT_HC", hc)
+	t.Setenv("HC_TERMINAL_ID", "t2x")
+
+	p := New("%1")
+	if !p.Enabled() {
+		t.Fatal("disabled")
 	}
-	p := &Publisher{hc: hc, target: "t3"} // no window to find another terminal by
+	defer p.Close(status.Summary{})
+	if p.target != "" || p.window != "42" {
+		t.Errorf("target=%q window=%q, want the label path only", p.target, p.window)
+	}
+}
+
+func TestNewUsesTheEnvironmentTerminalOutsideTmux(t *testing.T) {
+	dir := t.TempDir()
+	hc := filepath.Join(dir, "hc")
+	tmux := filepath.Join(dir, "tmux")
+	os.WriteFile(hc, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	os.WriteFile(tmux, []byte("#!/bin/sh\nexit 1\n"), 0o755)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("MUXLIGHT_HC", hc)
+	t.Setenv("HC_TERMINAL_ID", "t3")
+
+	p := New("%1")
+	if !p.Enabled() {
+		t.Fatal("disabled")
+	}
+	defer p.Close(status.Summary{})
+	if p.target != "t3" || p.window != "" {
+		t.Errorf("target=%q window=%q, want the environment terminal only", p.target, p.window)
+	}
+}
+
+func TestDebugFileRecordsAFailedReport(t *testing.T) {
+	dir := t.TempDir()
+	hc := filepath.Join(dir, "hc")
+	os.WriteFile(hc, []byte("#!/bin/sh\nexit 3\n"), 0o755)
+	logf := filepath.Join(dir, "debug")
+	t.Setenv("MUXLIGHT_DEBUG", logf)
+	p := &Publisher{hc: hc, target: "t3"}
 	p.send(working())
-	if p.target != "t3" {
-		t.Errorf("dropped its only target: %q", p.target)
+	if got := lines(t, logf); len(got) != 1 || !strings.Contains(got[0], "report to t3 failed") {
+		t.Errorf("debug log = %v", got)
 	}
 }

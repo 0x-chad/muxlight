@@ -3,7 +3,7 @@ package herdr
 import (
 	"os"
 	"path/filepath"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,253 +11,142 @@ import (
 	"github.com/paipaiio/muxlight/internal/status"
 )
 
-// fakeHC writes an hc stand-in. `ls` answers only for the label
-// herdr.window=42 and prints the address t9; `report` appends its arguments to
-// a log, and fails when the file "gone" exists, as hc does for a terminal that
-// has been closed.
-func fakeHC(t *testing.T) (hc, log, gone string) {
+// fakeHC writes an hc stand-in whose `ls` finds, for the label
+// herdr.window=42, the address written in the file it returns ("" for none).
+func fakeHC(t *testing.T) (hc, addr string) {
 	t.Helper()
 	dir := t.TempDir()
-	log = filepath.Join(dir, "log")
-	gone = filepath.Join(dir, "gone")
+	addr = filepath.Join(dir, "addr")
 	hc = filepath.Join(dir, "hc")
 	script := `#!/bin/sh
-case "$1" in
-ls)
-  for a in "$@"; do
-    if [ "$a" = "herdr.window=42" ]; then
-      echo "ls $*" >> ` + log + `
-      echo '{"terminals":[{"address":"t9"}]}'
-      exit 0
-    fi
-  done
-  echo '{"terminals":[]}'
-  ;;
-report)
-  [ -e ` + gone + ` ] && exit 1
-  echo "$*" >> ` + log + `
-  ;;
-esac
+for a in "$@"; do
+  if [ "$a" = "herdr.window=42" ] && [ -s ` + addr + ` ]; then
+    echo "{\"terminals\":[{\"address\":\"$(cat ` + addr + `)\"}]}"
+    exit 0
+  fi
+done
+echo '{"terminals":[]}'
 `
 	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return hc, log, gone
+	return hc, addr
 }
 
-func lines(t *testing.T, path string) []string {
+func setAddr(t *testing.T, path, v string) {
 	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
+	if err := os.WriteFile(path, []byte(v), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	return strings.Split(strings.TrimSpace(string(b)), "\n")
+}
+
+// sink records what the publisher writes to the pane.
+type sink struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (s *sink) inject(b []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.got = append(s.got, string(b))
+}
+
+func (s *sink) all() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.got...)
+}
+
+func (s *sink) waitFor(t *testing.T, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := s.all(); len(got) >= n {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("got %d writes, want %d: %q", len(s.all()), n, s.all())
+	return nil
 }
 
 func working() status.Summary { return status.Summary{State: pst.StateWorking, App: "codex"} }
+func done() status.Summary    { return status.Summary{State: pst.StateDone, App: "codex"} }
 
-func TestReportsToTerminalFoundByLabel(t *testing.T) {
-	hc, log, _ := fakeHC(t)
-	p := &Publisher{hc: hc, window: "42"}
-	p.send(working())
-	p.send(working())
+func newTest(t *testing.T) (*Publisher, *sink, string) {
+	hc, addr := fakeHC(t)
+	s := &sink{}
+	p := &Publisher{hc: hc, window: "42", inject: s.inject, retry: 20 * time.Millisecond}
+	p.start()
+	return p, s, addr
+}
 
-	got := lines(t, log)
-	var reports, lookups int
-	for _, l := range got {
-		switch {
-		case strings.HasPrefix(l, "report"):
-			reports++
-			if !strings.Contains(l, "--terminal t9") {
-				t.Errorf("report not sent to the labelled terminal: %q", l)
-			}
-		case strings.HasPrefix(l, "ls"):
-			lookups++
-		}
-	}
-	if reports != 2 {
-		t.Errorf("reports = %d, want 2 (%v)", reports, got)
-	}
-	if lookups != 1 {
-		t.Errorf("lookups = %d, want 1: the address is kept between reports", lookups)
+func TestPassthroughWrapsTheReportForTmux(t *testing.T) {
+	got := string(Passthrough("state=working:app=codex"))
+	want := "\x1bPtmux;\x1b\x1b]7501;state=working:app=codex\x1b\x1b\\\x1b\\"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func TestNoLabelledTerminalMeansNoReport(t *testing.T) {
-	hc, log, _ := fakeHC(t)
-	p := &Publisher{hc: hc, window: "7"}
-	p.send(working())
-	if got := lines(t, log); len(got) != 0 {
-		t.Errorf("sent something with no terminal to send it to: %v", got)
+func TestSendsWhenAHerdrTerminalExists(t *testing.T) {
+	p, s, addr := newTest(t)
+	setAddr(t, addr, "t9")
+	p.Publish(working())
+	got := s.waitFor(t, 1)
+	if got[0] != string(Passthrough("state=working:app=codex")) {
+		t.Fatalf("wrote %q", got[0])
+	}
+	p.Close(done())
+	if last := s.all()[len(s.all())-1]; last != string(Passthrough("state=done:app=codex")) {
+		t.Fatalf("final write %q", last)
 	}
 }
 
-func TestLooksUpAgainAfterAReportFails(t *testing.T) {
-	hc, log, gone := fakeHC(t)
-	p := &Publisher{hc: hc, window: "42"}
-	p.send(working())
-	if err := os.WriteFile(gone, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p.send(working()) // report fails: the terminal is gone
-	if p.resolved != "" {
-		t.Fatalf("address kept after its report failed: %q", p.resolved)
-	}
-	os.Remove(gone)
-	p.send(working())
-
-	var lookups int
-	for _, l := range lines(t, log) {
-		if strings.HasPrefix(l, "ls") {
-			lookups++
-		}
-	}
-	if lookups != 2 {
-		t.Errorf("lookups = %d, want 2 (initial and after the failure)", lookups)
+func TestWritesNothingWithoutAHerdrTerminal(t *testing.T) {
+	p, s, _ := newTest(t)
+	p.Publish(working())
+	time.Sleep(100 * time.Millisecond)
+	p.Close(done())
+	if got := s.all(); len(got) != 0 {
+		t.Fatalf("wrote %q with no herdr tab", got)
 	}
 }
 
-func TestHerdrStartedAgentReportsStraightToItsTerminal(t *testing.T) {
-	hc, log, _ := fakeHC(t)
-	p := &Publisher{hc: hc, target: "t3"}
-	p.send(working())
-	for _, l := range lines(t, log) {
-		if strings.HasPrefix(l, "ls") {
-			t.Errorf("looked up a terminal when HC_TERMINAL_ID named one: %q", l)
-		}
-	}
-	if got := lines(t, log); len(got) != 1 || !strings.Contains(got[0], "--terminal t3") {
-		t.Errorf("got %v, want one report to t3", got)
-	}
-}
-
-// A terminal attached after the agent last changed state must still be told
-// the current status, without waiting for the next change.
-func TestResendsCurrentStatusOnceATerminalAppears(t *testing.T) {
-	dir := t.TempDir()
-	log := filepath.Join(dir, "log")
-	up := filepath.Join(dir, "up")
-	hc := filepath.Join(dir, "hc")
-	script := `#!/bin/sh
-case "$1" in
-ls)
-  if [ -e ` + up + ` ]; then echo '{"terminals":[{"address":"t9"}]}'; else echo '{"terminals":[]}'; fi
-  ;;
-report)
-  echo "$*" >> ` + log + `
-  ;;
-esac
-`
-	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	p := &Publisher{
-		hc:     hc,
-		window: "42",
-		retry:  20 * time.Millisecond,
-		latest: make(chan status.Summary, 1),
-		done:   make(chan struct{}),
-	}
-	go p.loop()
-	defer func() { close(p.latest); <-p.done }()
-
-	p.Publish(working()) // no terminal yet: nothing to send it to
+func TestResendsOnceATerminalAppears(t *testing.T) {
+	p, s, addr := newTest(t)
+	p.Publish(working())
+	time.Sleep(50 * time.Millisecond)
+	setAddr(t, addr, "t9")
+	s.waitFor(t, 1)
+	// Already told: no repeats while the same terminal stays.
 	time.Sleep(150 * time.Millisecond)
-	if got := lines(t, log); len(got) != 0 {
-		t.Fatalf("reported with no terminal: %v", got)
+	if got := s.all(); len(got) != 1 {
+		t.Fatalf("repeated to the same terminal: %q", got)
 	}
-
-	if err := os.WriteFile(up, nil, 0o644); err != nil { // the tab is attached
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := lines(t, log); len(got) > 0 {
-			if !strings.Contains(got[0], "state=working") || !strings.Contains(got[0], "--terminal t9") {
-				t.Fatalf("resent the wrong thing: %v", got)
-			}
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("status was never resent after the terminal appeared")
+	// Hidden and shown again: a new terminal hears the status again.
+	setAddr(t, addr, "t10")
+	s.waitFor(t, 2)
+	p.Close(done())
 }
 
-// A pane with a target reports only there: no lookup, and no second path if
-// the report fails. New is what keeps a leaked HC_TERMINAL_ID out of a tmux
-// pane (see TestNewIgnoresTheEnvironmentTerminalInsideTmux).
-func TestTargetIsNeverReplacedByALabelLookup(t *testing.T) {
-	dir := t.TempDir()
-	log := filepath.Join(dir, "log")
-	hc := filepath.Join(dir, "hc")
-	script := `#!/bin/sh
-echo "$*" >> ` + log + `
-exit 3
-`
-	if err := os.WriteFile(hc, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p := &Publisher{hc: hc, target: "t3", window: "42"}
-	p.send(working())
-	got := lines(t, log)
-	if len(got) != 1 || !strings.HasPrefix(got[0], "report") {
-		t.Errorf("got %v, want a single failed report and no lookup", got)
-	}
-	if p.target != "t3" {
-		t.Errorf("target changed: %q", p.target)
-	}
+func TestRefreshResendsToTheSameTerminal(t *testing.T) {
+	p, s, addr := newTest(t)
+	setAddr(t, addr, "t9")
+	p.Publish(working())
+	s.waitFor(t, 1)
+	p.Refresh()
+	s.waitFor(t, 2)
+	p.Close(done())
 }
 
-func TestNewIgnoresTheEnvironmentTerminalInsideTmux(t *testing.T) {
-	dir := t.TempDir()
-	hc := filepath.Join(dir, "hc")
-	tmux := filepath.Join(dir, "tmux")
-	os.WriteFile(hc, []byte("#!/bin/sh\nexit 0\n"), 0o755)
-	os.WriteFile(tmux, []byte("#!/bin/sh\necho @42\n"), 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	t.Setenv("MUXLIGHT_HC", hc)
-	t.Setenv("HC_TERMINAL_ID", "t2x")
-
-	p := New("%1")
-	if !p.Enabled() {
-		t.Fatal("disabled")
-	}
-	defer p.Close(status.Summary{})
-	if p.target != "" || p.window != "42" {
-		t.Errorf("target=%q window=%q, want the label path only", p.target, p.window)
-	}
-}
-
-func TestNewUsesTheEnvironmentTerminalOutsideTmux(t *testing.T) {
-	dir := t.TempDir()
-	hc := filepath.Join(dir, "hc")
-	tmux := filepath.Join(dir, "tmux")
-	os.WriteFile(hc, []byte("#!/bin/sh\nexit 0\n"), 0o755)
-	os.WriteFile(tmux, []byte("#!/bin/sh\nexit 1\n"), 0o755)
-	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	t.Setenv("MUXLIGHT_HC", hc)
-	t.Setenv("HC_TERMINAL_ID", "t3")
-
-	p := New("%1")
-	if !p.Enabled() {
-		t.Fatal("disabled")
-	}
-	defer p.Close(status.Summary{})
-	if p.target != "t3" || p.window != "" {
-		t.Errorf("target=%q window=%q, want the environment terminal only", p.target, p.window)
-	}
-}
-
-func TestDebugFileRecordsAFailedReport(t *testing.T) {
-	dir := t.TempDir()
-	hc := filepath.Join(dir, "hc")
-	os.WriteFile(hc, []byte("#!/bin/sh\nexit 3\n"), 0o755)
-	logf := filepath.Join(dir, "debug")
-	t.Setenv("MUXLIGHT_DEBUG", logf)
-	p := &Publisher{hc: hc, target: "t3"}
-	p.send(working())
-	if got := lines(t, logf); len(got) != 1 || !strings.Contains(got[0], "report to t3 failed") {
-		t.Errorf("debug log = %v", got)
+func TestDisabledPublisherDoesNothing(t *testing.T) {
+	var p Publisher
+	p.Publish(working())
+	p.Refresh()
+	p.Close(done())
+	if p.Enabled() {
+		t.Fatal("zero Publisher is enabled")
 	}
 }

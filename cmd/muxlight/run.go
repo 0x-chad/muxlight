@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sync"
 	"syscall"
 	"time"
@@ -35,10 +36,22 @@ func cmdRun(args []string, e env) (int, error) {
 	pub := newAsyncPublisher(tmux.NewPublisher(e.runner, pane))
 	pub.publish(status.Summary{}) // drop a previous run's record
 	// Mirror into herdr, which cannot see the report itself through tmux.
-	hd := herdr.New(pane)
+	out := shim.NewOutput(e.stdout)
+	hd := herdr.New(pane, out.Inject)
 	hd.Publish(status.Summary{})
+	// A herdr view attaching usually resizes the window, and herdr-manage sends
+	// SIGWINCH after showing one: either way, tell herdr the status now. Older
+	// muxlight builds take SIGWINCH harmlessly too, which a new signal would not.
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	go func() {
+		for range winch {
+			hd.Refresh()
+		}
+	}()
+	defer func() { signal.Stop(winch); close(winch) }()
 
-	code, err := shim.RunWith(args, e.stdin, e.stdout, func(r pst.Report) {
+	code, err := shim.RunWith(args, e.stdin, out, func(r pst.Report) {
 		if len(store.Apply(r)) > 0 {
 			s := status.Summarize(store.All())
 			pub.send(s)
